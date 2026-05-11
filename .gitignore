@@ -1,0 +1,104 @@
+# -------------------------------------------------
+# 1️⃣ Python 基础忽略
+# -------------------------------------------------
+# __pycache__ 目录和 .pyc/.pyo 编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Cython 编译产物（如果有的话）
+*.so
+*.pyd
+
+# 打包/分发产生的文件
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+*.manifest
+*.spec
+
+# 1️⃣️ pipenv / poetry / pip-tools 缓存
+Pipfile.lock
+poetry.lock
+requirements.txt   # <‑‑ 如果你希望把锁文件提交，请**删除这行**；否则把它加入 ignore
+# 如果你使用 pip‑compile（pip-tools）生成的 *_requirements.txt，保留自己想要的即可
+
+# -------------------------------------------------
+# 2️⃣ 虚拟环境（venv、conda、virtualenv 等）
+# -------------------------------------------------
+# 推荐把虚拟环境目录放在项目根目录之外；若放在根目录下面，请把其名称加进来
+venv/
+ENV/
+env/
+.venv/
+.conda/
+.condaenv/
+conda-env/
+.virtualenv/
+# Windows 下的虚拟环境
+*.venv
+# VS Code 的 Python 虚拟环境（.vscode 目录本身可以保留，但其中的 `settings.json` 里如果指向了本地 .venv，需要自行决定是否忽略）
+.vscode/**/python*
+
+# -------------------------------------------------
+# 3️⃣ IDE / 编辑器 / 操作系统产生的临时文件
+# -------------------------------------------------
+# VS Code
+.vscode/
+# PyCharm / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# OS 临时文件
+.DS_Store            # macOS
+Thumbs.db            # Windows
+desktop.ini          # Windows
+*.swp                # vim swap
+*~                   # emacs/vi backup
+
+# -------------------------------------------------
+# 4️⃣ 测试 / 代码覆盖 / 报告
+# -------------------------------------------------
+htmlcov/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+pytest_cache/
+test-results/
+junit/
+*.log
+
+# -------------------------------------------------
+# 5️⃣ Azure / 部署相关的临时文件
+# -------------------------------------------------
+# Azure Functions 本地调试产生的 *local.settings.json*（包含本地密钥）
+local.settings.json
+
+# Azure CLI/PowerShell 脚本产生的 .azure 文件夹（如果你在本地保存了登录信息）
+.azure/
+
+# Azure DevOps / GitHub Actions 产出的临时 artefact（如果你在本地手动下载后不想提交）
+artifact/
+artifacts/
+drop/
+
+# -------------------------------------------------
+# 6️⃣ 其它常见的临时文件
+# -------------------------------------------------
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*.ipynb
+
+# 代码生成器产出的文件（如果你使用 swagger / openapi 代码生成）
+generated/
+# 运行时产生的临时目录
+tmp/
+temp/
