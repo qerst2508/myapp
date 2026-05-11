@@ -1,0 +1,137 @@
+name: CI / CD (GitHub Actions)
+
+# 触发条件
+on:
+  push:
+    branches:
+      - main            # 主分支推送触发
+  pull_request:
+    branches:
+      - main            # PR 合并前也会跑一次测试
+
+# 环境变量（便于全局复用）
+env:
+  AZURE_WEBAPP_NAME: myapp-prod-2026          # 与上面创建的 WebApp 同名
+  RESOURCE_GROUP: rg-myapp
+  SLOT_NAME: staging
+  PYTHON_VERSION: '3.11'                      # 与 Azure 中配置的 runtime 保持一致
+  PACKAGE_NAME: app.zip
+
+jobs:
+  # -------------------------------------------------
+  # 1️⃣ Build & Test
+  # -------------------------------------------------
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests (pytest)
+        run: |
+          pip install pytest pytest-cov
+          pytest -q --junitxml=reports/junit.xml
+
+      - name: Publish Test Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: reports/junit.xml
+
+      - name: Archive app for deployment
+        run: |
+          zip -r ${{ env.PACKAGE_NAME }} . \
+               -x ".git/*" ".github/*" "tests/*" "reports/*"
+        # 这里排除不需要的目录，确保 zip 包体积最小
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-package
+          path: ${{ env.PACKAGE_NAME }}
+
+  # -------------------------------------------------
+  # 2️⃣ Deploy to Staging Slot
+  # -------------------------------------------------
+  deploy-staging:
+    needs: build-test
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-package
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 设置 Staging Slot 的 runtime（确保和主站点一致）
+      - name: Set runtime on Staging slot
+        run: |
+          az webapp config set \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.AZURE_WEBAPP_NAME }} \
+            --slot ${{ env.SLOT_NAME }} \
+            --linux-fx-version "PYTHON|${{ env.PYTHON_VERSION }}"
+
+      - name: Deploy zip to Staging slot
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          slot-name: ${{ env.SLOT_NAME }}
+          package: ${{ env.PACKAGE_NAME }}
+
+  # -------------------------------------------------
+  # 3️⃣ (可选) 自动化集成测试在 Staging
+  # -------------------------------------------------
+  integration-test:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (again)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Call health endpoint (例子)
+        run: |
+          # 假设你的应用提供 /health 返回 200
+          curl -s -f -o /dev/null https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net/health
+
+  # -------------------------------------------------
+  # 4️⃣ Swap Staging → Production (蓝绿发布)
+  # -------------------------------------------------
+  swap-to-prod:
+    needs: [deploy-staging, integration-test]   # 确保测试通过后再 swap
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Swap slots (staging → production)
+        run: |
+          az webapp deployment slot swap \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.AZURE_WEBAPP_NAME }} \
+            --slot ${{ env.SLOT_NAME }} \
+            --target-slot production
