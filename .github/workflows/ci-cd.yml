@@ -14,7 +14,7 @@ env:
   AZURE_WEBAPP_NAME: myapp-prod-2026          # 与上面创建的 WebApp 同名
   RESOURCE_GROUP: rg-myapp
   SLOT_NAME: staging
-  PYTHON_VERSION: '3.11'                      # 与 Azure 中配置的 runtime 保持一致
+  PYTHON_VERSION: '3.14'                      # 与 Azure 中配置的 runtime 保持一致
   PACKAGE_NAME: app.zip
 
 jobs:
