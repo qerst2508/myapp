@@ -3,37 +3,36 @@ name: CI / CD (GitHub Actions)
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+  workflow_dispatch:          # 手動觸發
 
 env:
-  # ---- Azure ----
+  # Azure
   AZURE_WEBAPP_NAME: myapp-prod-2026
   RESOURCE_GROUP: rg-myapp
   SLOT_NAME: staging
 
-  # ---- Python ----
+  # Python / Build
   PYTHON_VERSION: '3.14'
   PACKAGE_NAME: app.zip
 
-  # ---- Node 24 強制使用 ----
+  # 強制使用 Node 24（避免 Node 20 退役警告）
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # -------------------------------------------------
-  # 1️⃣ Build & Test
-  # -------------------------------------------------
+  # -----------------------------------------------------------------
+  # 1️⃣ Build & (optional) Test
+  # -----------------------------------------------------------------
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Cache pip dependencies
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -47,9 +46,9 @@ jobs:
           pip install -r requirements.txt
 
       # -------------------------------------------------
-      # 如果你沒有測試，可以把下面兩行刪除或改成 echo "skip"
+      # 若你沒有測試，直接刪除下面 2 個 steps
       # -------------------------------------------------
-      - name: Run tests (pytest)
+      - name: Run pytest
         run: |
           pip install pytest
           pytest -q --junitxml=reports/junit.xml
@@ -59,7 +58,7 @@ jobs:
         with:
           name: test-results
           path: reports/junit.xml
-        # -------------------------------------------------
+      # -------------------------------------------------
 
       - name: Archive app (zip)
         run: |
@@ -72,9 +71,9 @@ jobs:
           name: app-package
           path: ${{ env.PACKAGE_NAME }}
 
-  # -------------------------------------------------
+  # -----------------------------------------------------------------
   # 2️⃣ Deploy to Staging slot
-  # -------------------------------------------------
+  # -----------------------------------------------------------------
   deploy-staging:
     needs: build-test
     runs-on: ubuntu-latest
@@ -82,8 +81,7 @@ jobs:
       name: staging
       url: https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net
     steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: app-package
 
@@ -107,9 +105,9 @@ jobs:
           slot-name: ${{ env.SLOT_NAME }}
           package: ${{ env.PACKAGE_NAME }}
 
-  # -------------------------------------------------
-  # 3️⃣ Integration test (健康檢查) – 這裡使用根路徑 /
-  # -------------------------------------------------
+  # -----------------------------------------------------------------
+  # 3️⃣ Integration test (health‑check) – 可自行更改 URL
+  # -----------------------------------------------------------------
   integration-test:
     needs: deploy-staging
     runs-on: ubuntu-latest
@@ -120,20 +118,20 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Health‑check (curl)
-        # 如你的應用提供 /health、/status、/ping 等，請自行修改 URL
+        # 若你的應用有 /health、/status、/ping 等健康端點，請自行修改
         run: |
-          INTEGRATION_URL="https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net/"
-          echo "Checking $INTEGRATION_URL …"
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$INTEGRATION_URL")
+          URL="https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net/"
+          echo "Checking $URL …"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
           if [ "$HTTP_STATUS" -ne 200 ]; then
             echo "❌ Health‑check failed (status $HTTP_STATUS)"
             exit 1
           fi
           echo "✅ Health‑check OK (status $HTTP_STATUS)"
 
-  # -------------------------------------------------
-  # 4️⃣ Swap Staging → Production (藍綠發布)
-  # -------------------------------------------------
+  # -----------------------------------------------------------------
+  # 4️⃣ Swap Staging → Production (藍綠發布) – 包含等待與重試
+  # -----------------------------------------------------------------
   swap-to-prod:
     needs: [deploy-staging, integration-test]
     runs-on: ubuntu-latest
@@ -141,13 +139,63 @@ jobs:
       name: production
       url: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net
     steps:
+      # ---------- ① 等待先前的 Swap 完成 ----------
+      - name: Wait for any previous slot‑swap operation to finish
+        id: wait-swap
+        run: |
+          RG="${{ env.RESOURCE_GROUP }}"
+          APP="${{ env.AZURE_WEBAPP_NAME }}"
+          MAX_WAIT_SECONDS=300   # 最長 5 分鐘，可自行調整
+          INTERVAL=10
+
+          elapsed=0
+          while true; do
+            pending=$(az webapp operation list \
+                       --resource-group "$RG" \
+                       --name "$APP" \
+                       --query "[?operationName=='SwapSiteSlots' && status!='Succeeded'].status" \
+                       -o tsv)
+
+            if [[ -z "$pending" ]]; then
+              echo "✅ No pending SwapSiteSlots operation."
+              break
+            else
+              echo "⏳ Pending swap detected (status: $pending). Waiting $INTERVAL s..."
+            fi
+
+            sleep $INTERVAL
+            elapsed=$((elapsed + INTERVAL))
+            if [[ $elapsed -gt $MAX_WAIT_SECONDS ]]; then
+              echo "⚠️ Waited $MAX_WAIT_SECONDS seconds but swap still in progress."
+              echo "   Continuing – the following swap may still fail."
+              break
+            fi
+          done
+
+      # ---------- ② Azure 登入 ----------
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Swap slots (staging → production)
+      # ---------- ③ 第一次 Swap ----------
+      - name: Swap slots (staging → production) – try 1
+        id: swap1
         run: |
+          az webapp deployment slot swap \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.AZURE_WEBAPP_NAME }} \
+            --slot ${{ env.SLOT_NAME }} \
+            --target-slot production
+        continue-on-error: true
+
+      # ---------- ④ 若第一次失敗，稍等後重試 ----------
+      - name: Retry swap if first attempt failed
+        if: steps.swap1.outcome == 'failure'
+        run: |
+          echo "🔁 First swap failed – probably because a previous operation was still running."
+          echo "   Waiting 20 seconds before retry..."
+          sleep 20
           az webapp deployment slot swap \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.AZURE_WEBAPP_NAME }} \
