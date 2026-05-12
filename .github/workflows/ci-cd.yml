@@ -1,37 +1,47 @@
 name: CI / CD (GitHub Actions)
 
+# -------------------------------------------------
+# 觸發方式
+# -------------------------------------------------
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+  workflow_dispatch:               # 手動觸發
 
+# -------------------------------------------------
+# 全域環境變數 – 包含 Node24 強制開啟
+# -------------------------------------------------
 env:
-  # ---------------- Azure ----------------
+  # ---------- Azure ----------
   AZURE_WEBAPP_NAME: myapp-prod-2026
   RESOURCE_GROUP: rg-myapp
   SLOT_NAME: staging
 
-  # ---------------- Python ---------------
+  # ---------- Python ----------
   PYTHON_VERSION: '3.14'
   PACKAGE_NAME: app.zip
 
-  # ---------------- Node 24 ---------------
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true    # 把所有 action 強制跑在 Node 24
+  # ---------- Node 24 ----------
+  # 讓所有 JavaScript‑type Action 在 Node 24 上執行（避免 Node 20 被淘汰的警告）
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# -------------------------------------------------
+# Job 1️⃣：Build & (optional) Test
+# -------------------------------------------------
 jobs:
-  # ---------------- Build & Test ----------------
   build-test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Cache pip
+      - name: Cache pip packages
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -44,7 +54,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ---------- 測試（可自行刪除） ----------
+      # ---------- 可選測試 ----------
       - name: Run pytest
         run: |
           pip install pytest
@@ -55,9 +65,10 @@ jobs:
         with:
           name: test-results
           path: reports/junit.xml
-      # ---------------------------------------
+      # -----------------------------------
 
-      - name: Archive app (zip)   # 這裡排除不必要的目錄
+      # ---------- 打包 (排除不必要檔案) ----------
+      - name: Archive app (zip)
         run: |
           zip -r ${{ env.PACKAGE_NAME }} . \
                -x ".git/*" ".github/*" "tests/*" "reports/*" \
@@ -69,7 +80,9 @@ jobs:
           name: app-package
           path: ${{ env.PACKAGE_NAME }}
 
-  # ---------------- Deploy to Staging ----------------
+# -------------------------------------------------
+# Job 2️⃣：Deploy to Staging slot
+# -------------------------------------------------
   deploy-staging:
     needs: build-test
     runs-on: ubuntu-latest
@@ -78,7 +91,8 @@ jobs:
       name: staging
       url: https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4
         with:
           name: app-package
 
@@ -87,7 +101,8 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Sync runtime (ensure same as production)
+      # ---------- 同步 Runtime ----------
+      - name: Sync runtime on Staging slot
         run: |
           az webapp config set \
             --resource-group ${{ env.RESOURCE_GROUP }} \
@@ -95,14 +110,39 @@ jobs:
             --slot ${{ env.SLOT_NAME }} \
             --linux-fx-version "PYTHON|${{ env.PYTHON_VERSION }}"
 
+      # ---------- 正式部署 ----------
+      # 使用官方的 v3 Action（目前最新且唯一可用的正式版）
       - name: Deploy zip to Staging slot
-        uses: azure/webapps-deploy@v4
+        uses: azure/webapps-deploy@v3          # ← 這裡 **必須是 v3**
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
           slot-name: ${{ env.SLOT_NAME }}
           package: ${{ env.PACKAGE_NAME }}
 
-  # ---------------- Integration test ----------------
+      # ---------- 可選：Run‑From‑Package ----------
+      # 如果你的 zip 很大或想省掉 Kudu 解壓時間，取消註解下面步驟並自行提供一個 Storage account
+      # - name: Upload package to Azure Storage & enable Run‑From‑Package
+      #   run: |
+      #     STORAGE_ACCOUNT=mydeploystore          # 事先建立
+      #     CONTAINER=packages
+      #     az storage container create -n $CONTAINER --account-name $STORAGE_ACCOUNT
+      #     SAS=$(az storage account generate-sas \
+      #           --permissions w \
+      #           --expiry $(date -u -d '+1 hour' +%Y-%m-%dT%H:%MZ) \
+      #           --services b \
+      #           --resource-types o \
+      #           --account-name $STORAGE_ACCOUNT -o tsv)
+      #     az storage blob upload -f ${{ env.PACKAGE_NAME }} -c $CONTAINER -n ${{ env.PACKAGE_NAME }} \
+      #           --account-name $STORAGE_ACCOUNT --sas-token "$SAS"
+      #     ZIP_URL=$(az storage blob url -c $CONTAINER -n ${{ env.PACKAGE_NAME }} --account-name $STORAGE_ACCOUNT -o tsv)
+      #     az webapp config appsettings set \
+      #       -g ${{ env.RESOURCE_GROUP }} \
+      #       -n ${{ env.AZURE_WEBAPP_NAME }} \
+      #       --settings WEBSITE_RUN_FROM_PACKAGE=$ZIP_URL
+
+# -------------------------------------------------
+# Job 3️⃣：Integration test (health‑check)
+# -------------------------------------------------
   integration-test:
     needs: deploy-staging
     runs-on: ubuntu-latest
@@ -115,7 +155,7 @@ jobs:
 
       - name: Health‑check (curl)
         run: |
-          # 改成你實際的健康端點；這裡使用根路徑作為示例
+          # 若你的 app 有 /health、/status、/ping，請自行改成該路徑
           URL="https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net/"
           echo "Checking $URL …"
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
@@ -125,7 +165,9 @@ jobs:
           fi
           echo "✅ Health‑check OK (status $HTTP_STATUS)"
 
-  # ---------------- Swap Staging → Production ----------------
+# -------------------------------------------------
+# Job 4️⃣：Swap Staging → Production (Blue‑Green)
+# -------------------------------------------------
   swap-to-prod:
     needs: [deploy-staging, integration-test]
     runs-on: ubuntu-latest
@@ -134,12 +176,13 @@ jobs:
       name: production
       url: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net
     steps:
+      # ---------- 等待前一筆 Swap 完成 ----------
       - name: Wait for any previous slot‑swap operation to finish
         id: wait-swap
         run: |
           RG="${{ env.RESOURCE_GROUP }}"
           APP="${{ env.AZURE_WEBAPP_NAME }}"
-          MAX_WAIT_SECONDS=300
+          MAX_WAIT_SECONDS=300      # 5 分鐘上限
           INTERVAL=10
           elapsed=0
           while true; do
@@ -157,16 +200,18 @@ jobs:
             sleep $INTERVAL
             elapsed=$((elapsed + INTERVAL))
             if [[ $elapsed -gt $MAX_WAIT_SECONDS ]]; then
-              echo "⚠️ Waited $MAX_WAIT_SECONDS seconds; proceeding anyway."
+              echo "⚠️ Waited $MAX_WAIT_SECONDS seconds, proceeding anyway."
               break
             fi
           done
 
+      # ---------- Azure 登入 ----------
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # ---------- 第一次 Swap ----------
       - name: Swap slots (staging → production) – try 1
         id: swap1
         run: |
@@ -175,12 +220,13 @@ jobs:
             --name ${{ env.AZURE_WEBAPP_NAME }} \
             --slot ${{ env.SLOT_NAME }} \
             --target-slot production
-        continue-on-error: true
+        continue-on-error: true   # 失敗時允許後續重試
 
+      # ---------- 若失敗則重試 ----------
       - name: Retry swap if first attempt failed
         if: steps.swap1.outcome == 'failure'
         run: |
-          echo "🔁 First swap failed – likely because a previous operation was still running."
+          echo "🔁 First swap failed – likely a previous operation still in progress."
           echo "   Waiting 20 seconds before retry..."
           sleep 20
           az webapp deployment slot swap \
