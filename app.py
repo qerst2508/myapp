@@ -4,7 +4,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Hello from Azure App Service!"
+    return "Double Hello from Azure App Service!"
 
 @app.route("/health")
 def health():
