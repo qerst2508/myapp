@@ -1,70 +1,93 @@
 name: CI / CD (GitHub Actions)
 
-# 触发方式：push 到 main 或手动触发
+# -------------------------------------------------
+# 触发方式
+#   1️⃣ push 到 main
+#   2️⃣ 手动触发（workflow_dispatch） → UI 上会出现 “Run workflow” 按钮
+# -------------------------------------------------
 on:
   push:
     branches: [main]
-  workflow_dispatch:   # 允许运维在 UI 手动点 “Run workflow”
+  workflow_dispatch:   # 允许运维在 GitHub UI 手动点 “Run workflow”
 
-# 全局环境变量
+# -------------------------------------------------
+# 全局环境变量（保持与 Azure 实际资源一致）
+# -------------------------------------------------
 env:
-  AZURE_WEBAPP_NAME: myapp-prod-2026      # ← 替换成你的 App Service 名称
-  RESOURCE_GROUP: rg-myapp
-  SLOT_NAME: staging
-  PYTHON_VERSION: '3.14'                  # ← 与 Azure 上的运行时保持一致
+  # Azure 资源
+  AZURE_WEBAPP_NAME: myapp-prod-2026   # 你的 App Service 名称
+  RESOURCE_GROUP: rg-myapp              # 资源组
+  SLOT_NAME: staging                    # 部署槽位名称（须与 Azure 中一致）
+
+  # Python 运行时（必须与 Azure 上的 linuxFxVersion 完全一致）
+  PYTHON_VERSION: '3.14'                # 这里写 3.14，不要写前缀 PYTHON|
+  
+  # 打包文件名（后续所有 job 共享）
   PACKAGE_NAME: app.zip
 
 # -------------------------------------------------
+# Job: 1️⃣ Build & Test
+# -------------------------------------------------
 jobs:
-  # -------------- 1️⃣ Build & Test ----------------
   build-test:
     runs-on: ubuntu-latest
     steps:
+      # 1️⃣ 拉取代码
       - name: Checkout source
         uses: actions/checkout@v4
 
+      # 2️⃣ 安装指定的 Python 版本
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # ---------- 缓存 pip 包 ----------
-      - name: Cache pip
+      # 3️⃣ 缓存 pip 包（加速后续 runs）
+      - name: Cache pip dependencies
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: pip-
+          restore-keys: |
+            pip-
 
+      # 4️⃣ 安装项目依赖
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 5️⃣ 运行单元/集成测试（示例使用 pytest）
       - name: Run tests
         run: |
+          # 如果你使用的是 unittest，改成 `python -m unittest discover`
           pip install pytest
           pytest -q --junitxml=reports/junit.xml
 
-      - name: Upload test results (artifact)
+      # 6️⃣ 把测试报告保存为 artifact（方便后期下载查看）
+      - name: Upload test results
         uses: actions/upload-artifact@v4
         with:
           name: test-results
           path: reports/junit.xml
 
-      # ---------- 打包 ----------
+      # 7️⃣ 打包应用（zip 部署需要的文件）
       - name: Archive app (zip)
         run: |
+          # 排除不必要的目录，确保包体尽可能小
           zip -r ${{ env.PACKAGE_NAME }} . \
-               -x ".git/*" ".github/*" "tests/*" "reports/*"
+               -x ".git/*" ".github/*" "tests/*" "reports/*" "*/__pycache__/*"
 
+      # 8️⃣ 把 zip 包上传为 artifact（后面的 Deploy job 直接下载使用）
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-package
           path: ${{ env.PACKAGE_NAME }}
 
-  # -------------- 2️⃣ Deploy to Staging ----------
+# -------------------------------------------------
+# Job: 2️⃣ Deploy to Staging slot
+# -------------------------------------------------
   deploy-staging:
     needs: build-test
     runs-on: ubuntu-latest
@@ -72,18 +95,20 @@ jobs:
       name: staging
       url: https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net
     steps:
+      # 1️⃣ 读取上一步上传的 zip 包
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: app-package
 
+      # 2️⃣ 登录 Azure（使用仓库 secret 中的 Service Principal）
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # 确保 Staging slot 的 runtime 与 Production 一致
-      - name: Sync runtime on Staging slot
+      # 3️⃣ 确保 Staging slot 的 runtime 与 Production 完全一致
+      - name: Sync Python runtime on Staging slot
         run: |
           az webapp config set \
             --resource-group ${{ env.RESOURCE_GROUP }} \
@@ -91,6 +116,7 @@ jobs:
             --slot ${{ env.SLOT_NAME }} \
             --linux-fx-version "PYTHON|${{ env.PYTHON_VERSION }}"
 
+      # 4️⃣ Deploy zip 包到 Staging slot（使用 Azure 官方的 Zip Deploy Action）
       - name: Deploy zip to Staging slot
         uses: azure/webapps-deploy@v3
         with:
@@ -98,7 +124,9 @@ jobs:
           slot-name: ${{ env.SLOT_NAME }}
           package: ${{ env.PACKAGE_NAME }}
 
-  # -------------- 3️⃣ Integration test on Staging ----------
+# -------------------------------------------------
+# Job: 3️⃣ Integration test on Staging (可选但强烈推荐)
+# -------------------------------------------------
   integration-test:
     needs: deploy-staging
     runs-on: ubuntu-latest
@@ -108,19 +136,23 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Health check (curl)
+      - name: Simple health‑check (curl)
+        # 假设你的 API 在根路径或 /health 返回 200
         run: |
-          # 建议把 /health 写在你的 Flask / FastAPI 里
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net/health)
-          if [ "$STATUS" -ne 200 ]; then
-            echo "❌ Health check failed (status $STATUS)"
+          STAGING_URL="https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net/health"
+          echo "Checking $STAGING_URL …"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL")
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "❌ Health‑check failed (status $HTTP_STATUS)"
             exit 1
           fi
-          echo "✅ Health check OK"
+          echo "✅ Health‑check OK (status $HTTP_STATUS)"
 
-  # -------------- 4️⃣ Swap Staging → Production ----------
+# -------------------------------------------------
+# Job: 4️⃣ Swap Staging → Production (蓝绿发布)
+# -------------------------------------------------
   swap-to-prod:
-    needs: [deploy-staging, integration-test]   # 两者成功才会执行
+    needs: [deploy-staging, integration-test]   # 两个 job 都成功才会执行
     runs-on: ubuntu-latest
     environment:
       name: production
