@@ -1,107 +1,63 @@
 name: CI / CD (GitHub Actions)
 
-# -------------------------------------------------
-# 觸發方式
-# -------------------------------------------------
 on:
   push:
     branches: [main]
-  workflow_dispatch:               # 手動觸發
+  workflow_dispatch:
 
-# -------------------------------------------------
-# 全域環境變數 – 包含 Node24 強制開啟
-# -------------------------------------------------
 env:
-  # ---------- Azure ----------
+  # Azure
   AZURE_WEBAPP_NAME: myapp-prod-2026
   RESOURCE_GROUP: rg-myapp
   SLOT_NAME: staging
 
-  # ---------- Python ----------
+  # Python
   PYTHON_VERSION: '3.14'
   PACKAGE_NAME: app.zip
 
-  # ---------- Node 24 ----------
-  # 讓所有 JavaScript‑type Action 在 Node 24 上執行（避免 Node 20 被淘汰的警告）
+  # 強制使用 Node 24（避免 Node 20 被淘汰的警告）
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# -------------------------------------------------
-# Job 1️⃣：Build & (optional) Test
-# -------------------------------------------------
 jobs:
+  # ------------------- Build & Test -------------------
   build-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            pip-
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      # ---------- 可選測試 ----------
-      - name: Run pytest
-        run: |
-          pip install pytest
-          pytest -q --junitxml=reports/junit.xml
-
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: reports/junit.xml
-      # -----------------------------------
-
-      # ---------- 打包 (排除不必要檔案) ----------
-      - name: Archive app (zip)
+      - name: Archive app (zip)   # 排除不必要檔案，減小 zip 大小
         run: |
           zip -r ${{ env.PACKAGE_NAME }} . \
                -x ".git/*" ".github/*" "tests/*" "reports/*" \
                "venv/*" "node_modules/*" "__pycache__/*"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: app-package
           path: ${{ env.PACKAGE_NAME }}
 
-# -------------------------------------------------
-# Job 2️⃣：Deploy to Staging slot
-# -------------------------------------------------
+  # ------------------- Deploy to Staging -------------------
   deploy-staging:
     needs: build-test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment:
-      name: staging
-      url: https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net
     steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: app-package
-
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      # ---------- 同步 Runtime ----------
+      # ==== 確保 webapp extension 已安裝 ====
+      - name: Ensure webapp extension is installed
+        run: |
+          az extension add --name webapp || az extension update --name webapp
       - name: Sync runtime on Staging slot
         run: |
           az webapp config set \
@@ -109,53 +65,24 @@ jobs:
             --name ${{ env.AZURE_WEBAPP_NAME }} \
             --slot ${{ env.SLOT_NAME }} \
             --linux-fx-version "PYTHON|${{ env.PYTHON_VERSION }}"
-
-      # ---------- 正式部署 ----------
-      # 使用官方的 v3 Action（目前最新且唯一可用的正式版）
       - name: Deploy zip to Staging slot
-        uses: azure/webapps-deploy@v3          # ← 這裡 **必須是 v3**
+        uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
           slot-name: ${{ env.SLOT_NAME }}
           package: ${{ env.PACKAGE_NAME }}
 
-      # ---------- 可選：Run‑From‑Package ----------
-      # 如果你的 zip 很大或想省掉 Kudu 解壓時間，取消註解下面步驟並自行提供一個 Storage account
-      # - name: Upload package to Azure Storage & enable Run‑From‑Package
-      #   run: |
-      #     STORAGE_ACCOUNT=mydeploystore          # 事先建立
-      #     CONTAINER=packages
-      #     az storage container create -n $CONTAINER --account-name $STORAGE_ACCOUNT
-      #     SAS=$(az storage account generate-sas \
-      #           --permissions w \
-      #           --expiry $(date -u -d '+1 hour' +%Y-%m-%dT%H:%MZ) \
-      #           --services b \
-      #           --resource-types o \
-      #           --account-name $STORAGE_ACCOUNT -o tsv)
-      #     az storage blob upload -f ${{ env.PACKAGE_NAME }} -c $CONTAINER -n ${{ env.PACKAGE_NAME }} \
-      #           --account-name $STORAGE_ACCOUNT --sas-token "$SAS"
-      #     ZIP_URL=$(az storage blob url -c $CONTAINER -n ${{ env.PACKAGE_NAME }} --account-name $STORAGE_ACCOUNT -o tsv)
-      #     az webapp config appsettings set \
-      #       -g ${{ env.RESOURCE_GROUP }} \
-      #       -n ${{ env.AZURE_WEBAPP_NAME }} \
-      #       --settings WEBSITE_RUN_FROM_PACKAGE=$ZIP_URL
-
-# -------------------------------------------------
-# Job 3️⃣：Integration test (health‑check)
-# -------------------------------------------------
+  # ------------------- Integration test -------------------
   integration-test:
     needs: deploy-staging
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
-      - name: Azure Login (again)
+      - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-
       - name: Health‑check (curl)
         run: |
-          # 若你的 app 有 /health、/status、/ping，請自行改成該路徑
           URL="https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.SLOT_NAME }}.azurewebsites.net/"
           echo "Checking $URL …"
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
@@ -165,72 +92,59 @@ jobs:
           fi
           echo "✅ Health‑check OK (status $HTTP_STATUS)"
 
-# -------------------------------------------------
-# Job 4️⃣：Swap Staging → Production (Blue‑Green)
-# -------------------------------------------------
+  # ------------------- Swap Staging → Production -------------------
   swap-to-prod:
     needs: [deploy-staging, integration-test]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    environment:
-      name: production
-      url: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net
     steps:
-      # ---------- 等待前一筆 Swap 完成 ----------
-      - name: Wait for any previous slot‑swap operation to finish
-        id: wait-swap
-        run: |
-          RG="${{ env.RESOURCE_GROUP }}"
-          APP="${{ env.AZURE_WEBAPP_NAME }}"
-          MAX_WAIT_SECONDS=300      # 5 分鐘上限
-          INTERVAL=10
-          elapsed=0
-          while true; do
-            pending=$(az webapp operation list \
-                       --resource-group "$RG" \
-                       --name "$APP" \
-                       --query "[?operationName=='SwapSiteSlots' && status!='Succeeded'].status" \
-                       -o tsv)
-            if [[ -z "$pending" ]]; then
-              echo "✅ No pending SwapSiteSlots operation."
-              break
-            else
-              echo "⏳ Pending swap detected (status: $pending). Waiting $INTERVAL s..."
-            fi
-            sleep $INTERVAL
-            elapsed=$((elapsed + INTERVAL))
-            if [[ $elapsed -gt $MAX_WAIT_SECONDS ]]; then
-              echo "⚠️ Waited $MAX_WAIT_SECONDS seconds, proceeding anyway."
-              break
-            fi
-          done
-
-      # ---------- Azure 登入 ----------
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # ---------- 第一次 Swap ----------
-      - name: Swap slots (staging → production) – try 1
-        id: swap1
+      # ---- 必須先安裝 webapp extension，因為下面會用到 `az webapp deployment operation …` (如果你僅用 retry，可以省略) ----
+      - name: Ensure webapp extension is installed
         run: |
-          az webapp deployment slot swap \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.AZURE_WEBAPP_NAME }} \
-            --slot ${{ env.SLOT_NAME }} \
-            --target-slot production
-        continue-on-error: true   # 失敗時允許後續重試
+          az extension add --name webapp || az extension update --name webapp
 
-      # ---------- 若失敗則重試 ----------
-      - name: Retry swap if first attempt failed
-        if: steps.swap1.outcome == 'failure'
+      - name: Swap slots (staging → production) with retry
+        id: swap-with-retry
         run: |
-          echo "🔁 First swap failed – likely a previous operation still in progress."
-          echo "   Waiting 20 seconds before retry..."
-          sleep 20
-          az webapp deployment slot swap \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.AZURE_WEBAPP_NAME }} \
-            --slot ${{ env.SLOT_NAME }} \
-            --target-slot production
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          maxAttempts=5
+          attempt=1
+
+          while (( attempt <= maxAttempts )); do
+            echo "🔁 Swap attempt $attempt / $maxAttempts"
+            set +e
+            output=$(az webapp deployment slot swap \
+                       --resource-group ${{ env.RESOURCE_GROUP }} \
+                       --name ${{ env.AZURE_WEBAPP_NAME }} \
+                       --slot ${{ env.SLOT_NAME }} \
+                       --target-slot production 2>&1)
+            exitCode=$?
+            set -e
+
+            if [[ $exitCode -eq 0 ]]; then
+              echo "✅ Swap succeeded"
+              exit 0
+            fi
+
+            echo "❌ Swap failed (exit code $exitCode)"
+            echo "$output"
+
+            if echo "$output" | grep -i "another operation is in progress" > /dev/null; then
+              echo "⏳ Detected concurrent operation – waiting 30 seconds..."
+              sleep 30
+            else
+              echo "⚠️ Unexpected error – aborting."
+              exit $exitCode
+            fi
+
+            ((attempt++))
+          done
+
+          echo "❌ All $maxAttempts attempts failed."
+          exit 1
