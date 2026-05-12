@@ -3,6 +3,11 @@ name: CI / CD (GitHub Actions)
 # 触发条件
 on:
   push:
+    branches: [main]
+  workflow_dispatch:
+
+on:
+  push:
     branches:
       - main            # 主分支推送触发
   pull_request:
